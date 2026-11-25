@@ -20,14 +20,12 @@ INTRADAY_TTL = int(os.environ.get("INTRADAY_TTL", 300))       # 5 menit
 HISTORICAL_TTL = int(os.environ.get("HISTORICAL_TTL", 21600)) # 6 jam
 NEWS_TTL = int(os.environ.get("NEWS_TTL", 1800))              # 30 menit
 
-# Opsional: Supabase REST Persistence agar data permanen aman saat container Render restart
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 LOCAL_STORE_PATH = os.environ.get("LOCAL_STORE_PATH", "/tmp/zigft_portfolio_store.json")
 
 WIB = timezone(timedelta(hours=7))
 
-# Aturan resmi 16 Pair TF 2025
 TF_PAIRS = {
     "NZDUSD": {"vp": 2, "min_sl": 10, "max_sl": 200, "pv": 0.0001, "tickers": ["NZDUSD=X"]},
     "AUDUSD": {"vp": 2, "min_sl": 10, "max_sl": 200, "pv": 0.0001, "tickers": ["AUDUSD=X"]},
@@ -63,15 +61,12 @@ _CACHE_LOCK = threading.Lock()
 _STORE_LOCK = threading.Lock()
 
 
-# ==============================================================================
-# PERSISTENCE LAYER (SUPABASE CLOUD REST + LOCAL DISK BACKUP)
-# ==============================================================================
 def _default_store():
     return {
-        "raw_entries": [],      # Data mentah: dihapus otomatis 2 jam setelah settlement 00:00 WIB
-        "daily_pnl": {},        # Data permanen: {"YYYY-MM-DD": {"pnl_usd": float, "pnl_pips": float, "wins": int, "losses": int, "trades": [...]}}
-        "sl_events": [],        # Data permanen SL untuk hitung kuota 3 SL/bulan & 3-day cooldown
-        "cooldown_until": None, # ISO UTC string jika cooldown 3 hari aktif
+        "raw_entries": [],
+        "daily_pnl": {},
+        "sl_events": [],
+        "cooldown_until": None,
     }
 
 
@@ -85,7 +80,6 @@ def _supabase_headers():
 
 
 def load_store() -> dict:
-    # 1. Coba baca dari Supabase jika environment variable tersedia
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             url = f"{SUPABASE_URL}/rest/v1/zigft_state?id=eq.main&select=payload"
@@ -99,7 +93,6 @@ def load_store() -> dict:
         except Exception:
             pass
 
-    # 2. Fallback ke file lokal
     if os.path.exists(LOCAL_STORE_PATH):
         try:
             with open(LOCAL_STORE_PATH, "r", encoding="utf-8") as f:
@@ -127,9 +120,6 @@ def save_store(store: dict):
             pass
 
 
-# ==============================================================================
-# MARKET DATA FETCHING & CACHING
-# ==============================================================================
 def get_killzone_info(now_utc: datetime):
     now_wib = now_utc.astimezone(WIB)
     wd = now_utc.weekday()
@@ -202,11 +192,9 @@ def _download_batch(tickers: list, period: str, interval: str) -> pd.DataFrame:
 
 
 def _compute_smc_structure(df_1h: pd.DataFrame, pv: float) -> dict:
-    """Menghitung SMC Dealing Range (H4 Swing High/Low, Fib 50-75% OTE) & Inducement Sweep."""
     if df_1h is None or len(df_1h) < 20:
         return {}
 
-    # Resample H1 ke H4 untuk struktur utama tanpa tambahan download
     df_4h = df_1h.resample("4h").agg({
         "Open": "first",
         "High": "max",
@@ -217,7 +205,6 @@ def _compute_smc_structure(df_1h: pd.DataFrame, pv: float) -> dict:
     if len(df_4h) < 8:
         df_4h = df_1h.copy()
 
-    # Deteksi fractal swing highs & swing lows (window=2) pada candle yang sudah tertutup
     closed_4h = df_4h.iloc[:-1] if len(df_4h) > 6 else df_4h
     highs = closed_4h["High"].values
     lows = closed_4h["Low"].values
@@ -233,12 +220,10 @@ def _compute_smc_structure(df_1h: pd.DataFrame, pv: float) -> dict:
     range_high = swing_highs[-1] if swing_highs else float(df_4h["High"].tail(18).max())
     range_low = swing_lows[-1] if swing_lows else float(df_4h["Low"].tail(18).min())
 
-    # Pastikan range valid dan cukup lebar
     if range_high <= range_low:
         range_high = float(df_4h["High"].tail(24).max())
         range_low = float(df_4h["Low"].tail(24).min())
 
-    # Deteksi Inducement (IDM) dari internal swing H1 36 jam terakhir
     recent_1h = df_1h.tail(36)
     h1_highs = recent_1h["High"].values
     h1_lows = recent_1h["Low"].values
@@ -421,7 +406,6 @@ def _refresh_intraday():
 
         smc_struct = _compute_smc_structure(df_1h, pv)
 
-        # Simpan bar 15m ringan untuk pengecekan TP/SL portofolio
         bars_list = []
         for ts, row in df_15m.tail(350).iterrows():
             bars_list.append({
@@ -457,95 +441,80 @@ def _refresh_intraday():
 
 
 def _refresh_news():
-    """Mengambil kalender ekonomi high-impact mingguan langsung dari feed live."""
-    try:
-        resp = requests.get(
-            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            raw = resp.json()
-            high_events = []
-            for item in raw:
-                if str(item.get("impact", "")).lower() == "high":
-                    high_events.append({
-                        "title": item.get("title", ""),
-                        "country": str(item.get("country", "")).upper(),
-                        "date": item.get("date", ""),
-                        "forecast": str(item.get("forecast", "")).strip(),
-                        "previous": str(item.get("previous", "")).strip(),
-                    })
-            return high_events
-    except Exception:
-        pass
+    """Mengambil kalender ekonomi high-impact mingguan dari mirror live tanpa dummy."""
+    endpoints = [
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    for url in endpoints:
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                raw = resp.json()
+                if isinstance(raw, list) and len(raw) > 0:
+                    high_events = []
+                    for item in raw:
+                        if str(item.get("impact", "")).lower() == "high":
+                            high_events.append({
+                                "title": item.get("title", ""),
+                                "country": str(item.get("country", "")).upper(),
+                                "date": item.get("date", ""),
+                                "forecast": str(item.get("forecast", "")).strip(),
+                                "previous": str(item.get("previous", "")).strip(),
+                            })
+                    return high_events
+        except Exception:
+            continue
     return _CACHE.get("news_events", [])
 
 
-def ensure_fresh_cache():
+def ensure_fresh_cache(force_intraday: bool = False, force_news: bool = False):
     now = time.time()
     with _CACHE_LOCK:
         if (now - _CACHE["historical_ts"]) > HISTORICAL_TTL or not _CACHE["historical_data"]:
             _CACHE["historical_data"] = _refresh_historical()
             _CACHE["historical_ts"] = time.time()
 
-        if (now - _CACHE["intraday_ts"]) > INTRADAY_TTL or not _CACHE["intraday_data"]:
+        if force_intraday or (now - _CACHE["intraday_ts"]) > INTRADAY_TTL or not _CACHE["intraday_data"]:
             intra, bars, csm = _refresh_intraday()
             _CACHE["intraday_data"] = intra
             _CACHE["intraday_bars"] = bars
             _CACHE["csm"] = csm
             _CACHE["intraday_ts"] = time.time()
 
-        if (now - _CACHE["news_ts"]) > NEWS_TTL or not _CACHE["news_events"]:
+        if force_news or (now - _CACHE["news_ts"]) > NEWS_TTL or not _CACHE["news_events"]:
             _CACHE["news_events"] = _refresh_news()
             _CACHE["news_ts"] = time.time()
 
 
-# ==============================================================================
-# EXACT 1.00 LOT USD PIP VALUE CALCULATOR (LIVE FX RATES)
-# ==============================================================================
 def get_usd_per_pip_1lot(pair: str) -> float:
-    """Menghitung nilai tepat $ per pip untuk 1.00 Standard Lot menggunakan kurs live."""
     pair = pair.upper()
     intra = _CACHE.get("intraday_data", {})
     pv = TF_PAIRS.get(pair, {}).get("pv", 0.0001)
 
     if pair == "XAUUSD":
-        # 1 standard lot Gold = 100 oz; 1 pip ($0.10) * 100 = $10.00
         return 10.0
-
     if pair.endswith("USD"):
-        # EURUSD, GBPUSD, AUDUSD, NZDUSD: 0.0001 * 100,000 = $10.00
         return 10.0
-
     if pair.startswith("USD"):
-        # USDJPY, USDCAD, USDCHF: (pv * 100,000) / spot_rate
         px = intra.get(pair, {}).get("last_price", 0)
-        if px > 0:
-            return round((pv * 100000.0) / px, 4)
-        return 6.5 if "JPY" in pair else 10.0
-
+        return round((pv * 100000.0) / px, 4) if px > 0 else (6.5 if "JPY" in pair else 10.0)
     if pair.endswith("JPY"):
-        # EURJPY, GBPJPY, AUDJPY, CADJPY, NZDJPY, CHFJPY: 1,000 JPY / USDJPY
         usdjpy = intra.get("USDJPY", {}).get("last_price", 0)
-        if usdjpy > 0:
-            return round(1000.0 / usdjpy, 4)
-        return 6.5
-
+        return round(1000.0 / usdjpy, 4) if usdjpy > 0 else 6.5
     if pair == "EURGBP":
         gbpusd = intra.get("GBPUSD", {}).get("last_price", 0)
         return round(10.0 * gbpusd, 4) if gbpusd > 0 else 12.7
-
     if pair == "EURNZD":
         nzdusd = intra.get("NZDUSD", {}).get("last_price", 0)
         return round(10.0 * nzdusd, 4) if nzdusd > 0 else 6.0
-
     return 10.0
 
 
-# ==============================================================================
-# PRE-NEWS PREDICTIVE BOT ENGINE (SEBELUM DATA KELUAR)
-# ==============================================================================
 def _parse_num(val_str: str):
     if not val_str:
         return None
@@ -558,10 +527,15 @@ def _parse_num(val_str: str):
         return None
 
 
-def analyze_pre_news_prediction(pair: str, now_utc: datetime, smc_zone: str, liq_data: dict, csm_data: dict):
-    base_ccy = pair[:3]
-    quote_ccy = pair[3:]
-    target_ccys = {"USD"} if pair == "XAUUSD" else {base_ccy, quote_ccy}
+def analyze_pre_news_prediction(pair: str, now_utc: datetime, smc_zone: str = "NEUTRAL", csm_data: dict = None):
+    csm_data = csm_data or {}
+    pair = pair.upper().strip()
+    if pair in TF_PAIRS:
+        base_ccy, quote_ccy = pair[:3], pair[3:]
+        target_ccys = {"USD"} if pair == "XAUUSD" else {base_ccy, quote_ccy}
+    else:
+        base_ccy, quote_ccy = "XAU", "USD"
+        target_ccys = {"USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
 
     upcoming = []
     for ev in _CACHE.get("news_events", []):
@@ -572,7 +546,7 @@ def analyze_pre_news_prediction(pair: str, now_utc: datetime, smc_zone: str, liq
         except Exception:
             continue
         diff_min = (ev_dt - now_utc).total_seconds() / 60.0
-        if diff_min >= -15:  # Tampilkan yang akan datang (atau baru rilis <15 menit lalu)
+        if diff_min >= -15:
             upcoming.append((diff_min, ev_dt, ev))
 
     upcoming.sort(key=lambda x: x[0])
@@ -580,6 +554,7 @@ def analyze_pre_news_prediction(pair: str, now_utc: datetime, smc_zone: str, liq
     if not upcoming:
         return {
             "has_event": False,
+            "pair_filter": pair or "ALL MAJORS",
             "note": f"Tidak ada jadwal berita High-Impact untuk {', '.join(sorted(target_ccys))} dalam sisa minggu ini.",
         }
 
@@ -590,10 +565,9 @@ def analyze_pre_news_prediction(pair: str, now_utc: datetime, smc_zone: str, liq
     f_val = _parse_num(ev["forecast"])
     p_val = _parse_num(ev["previous"])
 
-    # 1. Evaluasi Pergeseran Konsensus (Forecast vs Previous) sebelum rilis
     is_inverse = any(k in title.lower() for k in ["unemployment", "jobless", "claims"])
     ccy_bias = "NEUTRAL"
-    consensus_reason = "Konsensus Forecast sama dengan Previous (menunggu kejutan aktual)."
+    consensus_reason = "Konsensus Forecast sama dengan Previous (menunggu deviasi rilis)."
 
     if f_val is not None and p_val is not None and f_val != p_val:
         delta = f_val - p_val
@@ -603,15 +577,16 @@ def analyze_pre_news_prediction(pair: str, now_utc: datetime, smc_zone: str, liq
     elif f_val is None and p_val is not None:
         consensus_reason = f"Data Previous {ccy}: {ev['previous']} (tanpa angka Forecast)."
 
-    # Konversi bias mata uang ke arah Pair
     pair_fundamental_bias = "NEUTRAL"
     if ccy_bias != "NEUTRAL":
-        if ccy == base_ccy:
-            pair_fundamental_bias = ccy_bias
-        elif ccy == quote_ccy:
-            pair_fundamental_bias = "BEARISH" if ccy_bias == "BULLISH" else "BULLISH"
+        if pair in TF_PAIRS:
+            if ccy == base_ccy:
+                pair_fundamental_bias = ccy_bias
+            elif ccy == quote_ccy:
+                pair_fundamental_bias = "BEARISH" if ccy_bias == "BULLISH" else "BULLISH"
+        else:
+            pair_fundamental_bias = f"{ccy} {ccy_bias}"
 
-    # 2. Kombinasi dengan Pre-News SMC Liquidity Positioning (Antisipasi Rekayasa Likuiditas)
     smc_bias = "NEUTRAL"
     if "PREMIUM" in smc_zone or "OTE_SELL" in smc_zone:
         smc_bias = "BEARISH"
@@ -620,18 +595,16 @@ def analyze_pre_news_prediction(pair: str, now_utc: datetime, smc_zone: str, liq
 
     if pair_fundamental_bias != "NEUTRAL" and pair_fundamental_bias == smc_bias:
         final_pred = f"STRONG {pair_fundamental_bias}"
-        logic_summary = f"Konsensus & SMC searah: {consensus_reason} Ditambah harga sudah berada di zona {smc_zone}."
+        logic_summary = f"Konsensus & SMC searah: {consensus_reason} Harga sudah di zona {smc_zone}."
     elif pair_fundamental_bias != "NEUTRAL":
         final_pred = f"ANTICIPATE {pair_fundamental_bias}"
-        logic_summary = f"Berbasis pergeseran konsensus: {consensus_reason}"
+        logic_summary = f"Prediksi pra-rilis berbasis konsensus: {consensus_reason}"
     elif smc_bias != "NEUTRAL":
         final_pred = f"PRE-SWEEP {smc_bias}"
-        logic_summary = f"{consensus_reason} Harga terposisi di zona {smc_zone} (rawan sapuan likuiditas berlawanan sebelum berbalik)."
+        logic_summary = f"{consensus_reason} Harga di zona {smc_zone} (waspadai sapuan likuiditas berlawanan sebelum berbalik)."
     else:
-        base_s = csm_data.get(base_ccy, 5.0)
-        quote_s = csm_data.get(quote_ccy, 5.0)
-        final_pred = "NEUTRAL / WAIT SWEEP"
-        logic_summary = f"{consensus_reason} Momentum H1/H4 {base_ccy} ({base_s}) vs {quote_ccy} ({quote_s})."
+        final_pred = "WAIT SWEEP / NEUTRAL"
+        logic_summary = consensus_reason
 
     mins_int = int(round(diff_min))
     if mins_int < 0:
@@ -639,15 +612,15 @@ def analyze_pre_news_prediction(pair: str, now_utc: datetime, smc_zone: str, liq
     elif mins_int < 60:
         countdown_txt = f"{mins_int} menit lagi"
     else:
-        hrs = mins_int // 60
-        rem_m = mins_int % 60
-        countdown_txt = f"{hrs} jam {rem_m} menit lagi"
+        countdown_txt = f"{mins_int // 60} jam {mins_int % 60} menit lagi"
 
     return {
         "has_event": True,
+        "pair_filter": pair or "ALL MAJORS",
         "title": title,
         "currency": ccy,
         "release_wib": f"{HARI_ID[ev_wib.weekday()]}, {ev_wib.strftime('%H:%M WIB')}",
+        "release_ts_ms": int(ev_dt.timestamp() * 1000),
         "countdown": countdown_txt,
         "minutes_to_release": mins_int,
         "slippage_warning": 0 <= mins_int <= 30,
@@ -658,18 +631,9 @@ def analyze_pre_news_prediction(pair: str, now_utc: datetime, smc_zone: str, liq
     }
 
 
-# ==============================================================================
-# PORTFOLIO PRICE CHECKER, 00:00 WIB SETTLEMENT & +2H RAW CLEANUP
-# ==============================================================================
 def process_portfolio_lifecycle(force_check: bool = False):
-    """
-    1. Mengecek harga live/intraday apakah menyentuh TP atau SL pada raw_entries yang masih OPEN.
-    2. Setiap lewat jam 00:00 WIB (pergantian hari WIB), mengolah entry yang sudah TP/SL ke
-       Kalender PnL permanen & Equity Curve, lalu menandai settled_at & delete_after (+2 jam).
-    3. Menghapus raw_entries yang sudah melewati delete_after (2 jam setelah diolah).
-    """
     if force_check:
-        ensure_fresh_cache()
+        ensure_fresh_cache(force_intraday=True)
 
     now_utc = datetime.now(timezone.utc)
     now_wib = now_utc.astimezone(WIB)
@@ -681,7 +645,6 @@ def process_portfolio_lifecycle(force_check: bool = False):
         bars_cache = _CACHE.get("intraday_bars", {})
         intra_cache = _CACHE.get("intraday_data", {})
 
-        # STEP 1: Evaluasi sentuhan harga TP / SL untuk semua raw_entries berstatus OPEN
         for entry in store["raw_entries"]:
             if entry.get("status") != "OPEN":
                 continue
@@ -693,7 +656,6 @@ def process_portfolio_lifecycle(force_check: bool = False):
             tp_px = float(entry["tp"])
             created_dt = datetime.fromisoformat(entry["created_at"]).astimezone(timezone.utc)
 
-            # Kalibrasi basis GC=F -> Spot jika XAUUSD
             basis_offset = 0.0
             last_px = intra_cache.get(pair, {}).get("last_price", 0)
             if pair == "XAUUSD" and last_px > 0:
@@ -733,14 +695,12 @@ def process_portfolio_lifecycle(force_check: bool = False):
                     changed = True
                     break
 
-        # STEP 2: Settlement Jam 00:00 WIB -> Pindahkan yang sudah TP/SL dari hari sebelumnya (atau lewat 00:00 WIB) ke Kalender PnL Permanen
         for entry in store["raw_entries"]:
             if entry.get("settled"):
                 continue
             if entry.get("status") not in ("TP_HIT", "SL_HIT"):
                 continue
 
-            # Cek apakah sudah melewati jam 00:00 WIB sejak hit_at / created_at
             ref_iso = entry.get("hit_at") or entry["created_at"]
             ref_wib_date = datetime.fromisoformat(ref_iso).astimezone(WIB).strftime("%Y-%m-%d")
 
@@ -776,7 +736,6 @@ def process_portfolio_lifecycle(force_check: bool = False):
                     "pnl_usd": pnl_usd,
                 })
 
-                # Cek aturan ZIGFT: Max 3 SL per bulan -> Aktifkan Cooldown 3 Hari
                 ym_prefix = ref_wib_date[:7]
                 month_sls = [s for s in store["sl_events"] if s["date"].startswith(ym_prefix)]
                 if len(month_sls) >= 3:
@@ -785,13 +744,11 @@ def process_portfolio_lifecycle(force_check: bool = False):
                     if not existing_cd or datetime.fromisoformat(existing_cd) < cd_end:
                         store["cooldown_until"] = cd_end.isoformat()
 
-                # Tandai sudah diolah & jadwalkan penghapusan data mentah tepat 2 jam setelah diolah
                 entry["settled"] = True
                 entry["settled_at"] = now_utc.isoformat()
                 entry["delete_after"] = (now_utc + timedelta(hours=2)).isoformat()
                 changed = True
 
-        # STEP 3: Hapus data mentah riwayat entry yang sudah melewati 2 jam pasca-settlement
         remaining_raw = []
         for entry in store["raw_entries"]:
             if entry.get("settled") and entry.get("delete_after"):
@@ -818,7 +775,7 @@ def _background_lifecycle_loop():
             process_portfolio_lifecycle(force_check=False)
         except Exception:
             pass
-        time.sleep(180)  # Cek otomatis setiap 3 menit saat worker hidup
+        time.sleep(180)
 
 
 threading.Thread(target=_background_lifecycle_loop, daemon=True).start()
@@ -829,16 +786,13 @@ def get_zigft_rule_status(store: dict, now_utc: datetime):
     today_wib = now_wib.strftime("%Y-%m-%d")
     ym_wib = now_wib.strftime("%Y-%m")
 
-    # Hitung entry hari ini (1 entry / hari)
     today_entries = [
         e for e in store["raw_entries"]
         if datetime.fromisoformat(e["created_at"]).astimezone(WIB).strftime("%Y-%m-%d") == today_wib
     ]
-    # Tambahkan juga jika sudah ter-settle hari ini
     today_settled_trades = len(store["daily_pnl"].get(today_wib, {}).get("trades", []))
     daily_used = len(today_entries) + today_settled_trades
 
-    # Hitung SL bulan ini (permanen + yang belum settled bulan ini)
     perm_month_sl = len([s for s in store["sl_events"] if s["date"].startswith(ym_wib)])
     unsettled_month_sl = len([
         e for e in store["raw_entries"]
@@ -876,17 +830,35 @@ def get_zigft_rule_status(store: dict, now_utc: datetime):
     }
 
 
-# ==============================================================================
-# API ENDPOINTS
-# ==============================================================================
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "online",
         "service": "ZIGFT Quant & Portfolio Engine",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
+        "news_cached_count": len(_CACHE.get("news_events", [])),
         "cache_age_sec": round(time.time() - _CACHE["intraday_ts"], 1) if _CACHE["intraday_ts"] else None,
     })
+
+
+@app.route("/api/news-radar", methods=["GET"])
+def news_radar():
+    """Endpoint ringan khusus banner hitung mundur news & prediksi pre-news di bagian atas form."""
+    try:
+        pair = str(request.args.get("pair", "")).upper().strip()
+        with _CACHE_LOCK:
+            if (time.time() - _CACHE["news_ts"]) > NEWS_TTL or not _CACHE["news_events"]:
+                _CACHE["news_events"] = _refresh_news()
+                _CACHE["news_ts"] = time.time()
+
+        now_utc = datetime.now(timezone.utc)
+        pred = analyze_pre_news_prediction(pair=pair, now_utc=now_utc, csm_data=_CACHE.get("csm", {}))
+        return jsonify({
+            "server_now_ms": int(now_utc.timestamp() * 1000),
+            "news": pred,
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/quant-analysis", methods=["GET", "POST"])
@@ -921,7 +893,6 @@ def quant_analysis():
         rules_status = get_zigft_rule_status(store, now_utc)
         usd_per_pip = get_usd_per_pip_1lot(pair)
 
-        # Kalibrasi basis Futures GC=F vs Spot Entry
         basis_offset = 0.0
         if pair == "XAUUSD" and hist["ticker"] == "GC=F" and entry > 0:
             diff = entry - intra["last_price"]
@@ -935,7 +906,6 @@ def quant_analysis():
         asian_high = round(intra["asian_high"] + basis_offset, decimals)
         asian_low = round(intra["asian_low"] + basis_offset, decimals)
 
-        # 1. SMC Dealing Range (Fib 50% - 75% OTE) & Inducement Validator
         smc_raw = intra.get("smc", {})
         r_high = round(smc_raw.get("range_high", pdh) + basis_offset, decimals)
         r_low = round(smc_raw.get("range_low", pdl) + basis_offset, decimals)
@@ -947,20 +917,16 @@ def quant_analysis():
             fib_750 = round(r_high - (0.750 * span), decimals)
             retracement_pct = round(((r_high - entry) / span) * 100.0, 1) if entry > 0 else 50.0
             if 61.8 <= retracement_pct <= 79.0:
-                smc_zone = "OTE_BUY (61.8%–75%)"
-                smc_verdict = "OPTIMAL"
+                smc_zone, smc_verdict = "OTE_BUY (61.8%–75%)", "OPTIMAL"
                 smc_note = f"Entry di zona OTE Discount ({retracement_pct}% retracement dari H4 Swing High)."
             elif 50.0 <= retracement_pct < 61.8:
-                smc_zone = "DISCOUNT_BUY (>50%)"
-                smc_verdict = "VALID"
+                smc_zone, smc_verdict = "DISCOUNT_BUY (>50%)", "VALID"
                 smc_note = f"Entry berada di bawah Equilibrium 50% ({retracement_pct}% Discount)."
             elif retracement_pct > 79.0:
-                smc_zone = "DEEP_DISCOUNT (>75%)"
-                smc_verdict = "STRETCHED"
-                smc_note = f"Entry sangat dalam ({retracement_pct}%), waspadai struktur break di bawah {r_low}."
+                smc_zone, smc_verdict = "DEEP_DISCOUNT (>75%)", "STRETCHED"
+                smc_note = f"Entry sangat dalam ({retracement_pct}%), waspadai break di bawah {r_low}."
             else:
-                smc_zone = "PREMIUM_CHASING (<50%)"
-                smc_verdict = "CHASING"
+                smc_zone, smc_verdict = "PREMIUM_CHASING (<50%)", "CHASING"
                 smc_note = f"Entry masih di area Premium ({retracement_pct}%), belum masuk diskon 50%–75%."
 
             idm_swept = bool(smc_raw.get("idm_buy_swept", False))
@@ -975,20 +941,16 @@ def quant_analysis():
             fib_750 = round(r_low + (0.750 * span), decimals)
             retracement_pct = round(((entry - r_low) / span) * 100.0, 1) if entry > 0 else 50.0
             if 61.8 <= retracement_pct <= 79.0:
-                smc_zone = "OTE_SELL (61.8%–75%)"
-                smc_verdict = "OPTIMAL"
+                smc_zone, smc_verdict = "OTE_SELL (61.8%–75%)", "OPTIMAL"
                 smc_note = f"Entry di zona OTE Premium ({retracement_pct}% retracement dari H4 Swing Low)."
             elif 50.0 <= retracement_pct < 61.8:
-                smc_zone = "PREMIUM_SELL (>50%)"
-                smc_verdict = "VALID"
+                smc_zone, smc_verdict = "PREMIUM_SELL (>50%)", "VALID"
                 smc_note = f"Entry berada di atas Equilibrium 50% ({retracement_pct}% Premium)."
             elif retracement_pct > 79.0:
-                smc_zone = "DEEP_PREMIUM (>75%)"
-                smc_verdict = "STRETCHED"
+                smc_zone, smc_verdict = "DEEP_PREMIUM (>75%)", "STRETCHED"
                 smc_note = f"Entry sangat tinggi ({retracement_pct}%), waspadai breakout di atas {r_high}."
             else:
-                smc_zone = "DISCOUNT_CHASING (<50%)"
-                smc_verdict = "CHASING"
+                smc_zone, smc_verdict = "DISCOUNT_CHASING (<50%)", "CHASING"
                 smc_note = f"Entry masih di area Discount ({retracement_pct}%), belum masuk premium 50%–75%."
 
             idm_swept = bool(smc_raw.get("idm_sell_swept", False))
@@ -999,7 +961,6 @@ def quant_analysis():
                 else f"Belum ada sapuan Inducement BSL terbaru{f' (IDM di {idm_lvl})' if idm_lvl else ''}."
             )
 
-        # 2. Liquidity Sweep Risk terhadap SL
         sweep_alerts = []
         if sl > 0:
             if side == "buy":
@@ -1015,7 +976,6 @@ def quant_analysis():
                         pos_desc = f"{abs(dist_pips)} pips di atas {lbl}" if dist_pips >= 0 else f"{abs(dist_pips)} pips di bawah {lbl}"
                         sweep_alerts.append(f"SL {pos_desc} (zona stop-hunt BSL)")
 
-        # 3. ATR(14) & Daily Range Exhaustion
         atr_14_pips = hist["atr_14_pips"]
         today_range_pips = intra["today_range_pips"]
         exhaustion_pct = round((today_range_pips / atr_14_pips) * 100.0, 1) if atr_14_pips > 0 else 0.0
@@ -1029,7 +989,6 @@ def quant_analysis():
             atr_status = "OPTIMAL"
             atr_note = f"Target TP ({tp_pips} pips) realistis dalam kapasitas ATR-14 ({atr_14_pips} pips)."
 
-        # 4. Currency Strength Meter
         base_ccy, quote_ccy = pair[:3], pair[3:]
         base_str = csm.get(base_ccy, 5.0)
         quote_str = csm.get(quote_ccy, 5.0)
@@ -1051,19 +1010,16 @@ def quant_analysis():
 
         sorted_csm = sorted(csm.items(), key=lambda x: x[1], reverse=True)
 
-        # 5. Seasonality
         dow_data = hist["dow_stats"].get(kz["day_idx"], {})
         sess_lookup = "ASIA" if kz["session_key"] in ["ASIA", "DEAD_ZONE"] else (
             "LONDON" if kz["session_key"] in ["PRE_LONDON", "LONDON", "LONDON_MID"] else "NY"
         )
         sess_data = hist["session_stats"].get(sess_lookup, {})
 
-        # 6. Pre-News Predictive Bot
         news_pred = analyze_pre_news_prediction(
             pair=pair,
             now_utc=now_utc,
             smc_zone=smc_zone,
-            liq_data={"pdh": pdh, "pdl": pdl},
             csm_data=csm,
         )
 
@@ -1133,7 +1089,6 @@ def quant_analysis():
 
 @app.route("/api/entries", methods=["POST"])
 def create_entry():
-    """Mencatat setup valid ZIGFT ke daftar pantauan harga otomatis (1 Lot standar)."""
     try:
         payload = request.get_json(force=True)
         pair = str(payload.get("pair", "")).upper().strip()
@@ -1199,7 +1154,6 @@ def create_entry():
 
 @app.route("/api/portfolio", methods=["GET"])
 def get_portfolio():
-    """Mengembalikan data permanen Kalender PnL, Equity Curve, & Riwayat Entry aktif/buffer 2 jam."""
     try:
         force = str(request.args.get("force", "0")) == "1"
         store = process_portfolio_lifecycle(force_check=force)
@@ -1207,11 +1161,9 @@ def get_portfolio():
         now_wib = now_utc.astimezone(WIB)
         rules_status = get_zigft_rule_status(store, now_utc)
 
-        # Hitung waktu menuju 00:00 WIB berikutnya
         next_midnight_wib = (now_wib + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         mins_to_midnight = int((next_midnight_wib - now_wib).total_seconds() // 60)
 
-        # Bangun Equity Curve kronologis dari data permanen daily_pnl
         sorted_dates = sorted(store["daily_pnl"].keys())
         equity_curve = []
         cum_usd = 0.0
@@ -1235,7 +1187,6 @@ def get_portfolio():
         total_closed = total_wins + total_losses
         win_rate = round((total_wins / total_closed) * 100.0, 1) if total_closed > 0 else 0.0
 
-        # Format daftar raw_entries untuk ditampilkan (OPEN, menunggu 00:00 WIB, atau buffer 2 jam pasca-settlement)
         formatted_raw = []
         for e in reversed(store["raw_entries"]):
             item = dict(e)
@@ -1246,6 +1197,7 @@ def get_portfolio():
 
         return jsonify({
             "server_wib": now_wib.strftime("%d %b %Y, %H:%M WIB"),
+            "checked_at_wib": now_wib.strftime("%H:%M:%S WIB"),
             "next_settlement_wib": f"00:00 WIB ({mins_to_midnight // 60}j {mins_to_midnight % 60}m lagi)",
             "zigft_rules": rules_status,
             "summary": {
