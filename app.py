@@ -1,5 +1,6 @@
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, jsonify
@@ -20,32 +21,21 @@ HEADERS_BROWSER = {
     "Accept": "application/json,text/plain,*/*",
 }
 
-PAIR_TO_YAHOO = {
+# Hanya instrumen komoditas futures yang memakai simbol futures Yahoo Finance
+FUTURES_TICKERS = {
     "XAUUSD": "GC=F",
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "AUDUSD": "AUDUSD=X",
-    "NZDUSD": "NZDUSD=X",
-    "USDJPY": "USDJPY=X",
-    "USDCAD": "USDCAD=X",
-    "USDCHF": "USDCHF=X",
-    "EURGBP": "EURGBP=X",
-    "EURJPY": "EURJPY=X",
-    "GBPJPY": "GBPJPY=X",
-    "AUDJPY": "AUDJPY=X",
-    "NZDJPY": "NZDJPY=X",
-    "CADJPY": "CADJPY=X",
-    "CHFJPY": "CHFJPY=X",
-    "EURNZD": "EURNZD=X",
+    "XAGUSD": "SI=F",
 }
 
 CACHE_CHART = {}
 CACHE_NEWS = {"ts": 0.0, "events": []}
 CACHE_FX = {"ts": 0.0, "rates": {}}
+CACHE_STRENGTH = {"ts": 0.0, "scores": {}}
 
 CHART_TTL = 300
 NEWS_TTL = 1800
 FX_TTL = 600
+STRENGTH_TTL = 600
 
 
 def log_msg(msg: str):
@@ -57,7 +47,7 @@ def log_msg(msg: str):
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
     return response
 
 
@@ -69,7 +59,6 @@ def supabase_headers():
         "apikey": SUPABASE_KEY,
         "Content-Type": "application/json",
     }
-    # Format key baru Supabase (sb_secret_...) bukan JWT, jangan dikirim ke Authorization Bearer
     if SUPABASE_KEY.startswith("eyJ"):
         headers["Authorization"] = f"Bearer {SUPABASE_KEY}"
     return headers
@@ -127,10 +116,15 @@ def save_state(state: dict):
 
 
 # ==========================================
-# FAST DIRECT YAHOO CHART FETCHER
+# DIRECT YAHOO CHART FETCHER
 # ==========================================
+def yahoo_ticker_for(pair: str) -> str:
+    p = pair.upper().strip()
+    return FUTURES_TICKERS.get(p, f"{p}=X")
+
+
 def fetch_yahoo_candles(pair: str, interval: str = "15m", range_str: str = "5d", force: bool = False):
-    pair = pair.upper()
+    pair = pair.upper().strip()
     cache_key = (pair, interval, range_str)
     now_ts = time.time()
 
@@ -138,13 +132,13 @@ def fetch_yahoo_candles(pair: str, interval: str = "15m", range_str: str = "5d",
         if now_ts - CACHE_CHART[cache_key]["ts"] < CHART_TTL:
             return CACHE_CHART[cache_key]["data"], True
 
-    ticker = PAIR_TO_YAHOO.get(pair, f"{pair}=X")
+    ticker = yahoo_ticker_for(pair)
     hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
 
     for host in hosts:
         url = f"https://{host}/v8/finance/chart/{ticker}?interval={interval}&range={range_str}"
         try:
-            r = requests.get(url, headers=HEADERS_BROWSER, timeout=5)
+            r = requests.get(url, headers=HEADERS_BROWSER, timeout=6)
             if r.status_code != 200:
                 continue
             raw = r.json()
@@ -175,7 +169,7 @@ def fetch_yahoo_candles(pair: str, interval: str = "15m", range_str: str = "5d",
                 CACHE_CHART[cache_key] = {"ts": now_ts, "data": candles}
                 return candles, True
         except Exception as e:
-            log_msg(f"Yahoo timeout/err ({host}): {e}")
+            log_msg(f"Yahoo timeout/err ({host} {ticker}): {e}")
 
     if cache_key in CACHE_CHART:
         return CACHE_CHART[cache_key]["data"], False
@@ -183,98 +177,199 @@ def fetch_yahoo_candles(pair: str, interval: str = "15m", range_str: str = "5d",
 
 
 def pip_size_for(pair: str) -> float:
-    if "XAU" in pair:
+    p = pair.upper()
+    if "XAU" in p:
         return 0.1
-    if "JPY" in pair:
+    if "XAG" in p:
+        return 0.01
+    if "JPY" in p:
         return 0.01
     return 0.0001
 
 
 def decimals_for(pair: str) -> int:
-    if "XAU" in pair:
+    p = pair.upper()
+    if "XAU" in p:
         return 2
-    if "JPY" in pair:
+    if "XAG" in p:
+        return 3
+    if "JPY" in p:
         return 3
     return 5
 
 
+# ==========================================
+# LIVE PIP VALUE & FUTURES BASIS CALIBRATION
+# ==========================================
+def get_live_usd_rates() -> dict:
+    now_ts = time.time()
+    if now_ts - CACHE_FX["ts"] < FX_TTL and CACHE_FX["rates"]:
+        return CACHE_FX["rates"]
+    try:
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data.get("rates"), dict) and data["rates"]:
+                CACHE_FX["rates"] = data["rates"]
+                CACHE_FX["ts"] = now_ts
+    except Exception as e:
+        log_msg(f"FX rates API err: {e}")
+    return CACHE_FX.get("rates", {})
+
+
 def usd_per_pip_for(pair: str) -> float:
-    if pair.endswith("JPY"):
-        return 6.6
-    if pair == "EURGBP":
-        return 12.6
-    if pair in ("USDCAD", "USDCHF"):
-        return 7.2
-    return 10.0
+    """
+    Menghitung nilai USD per 1 pip untuk 1.00 Standard Lot secara dinamis dari kurs live:
+    - Pair berakhiran USD (EURUSD, GBPUSD, AUDUSD, XAUUSD): tepat $10.00/pip (spesifikasi kontrak).
+    - Cross / USD-base pair (USDJPY, EURGBP, USDCAD, dll.): konversi unit quote currency
+      menggunakan kurs live USD/{QUOTE} saat ini.
+    """
+    p = pair.upper().strip()
+    if p.endswith("USD"):
+        return 10.0
+
+    quote_ccy = p[3:]
+    pv = pip_size_for(p)
+    pip_in_quote = 100000.0 * pv  # 100,000 unit standard lot * ukuran 1 pip
+
+    rates = get_live_usd_rates()
+    usd_to_quote = rates.get(quote_ccy)
+
+    if not usd_to_quote or usd_to_quote <= 0:
+        # Fallback langsung ke live candle Yahoo Finance untuk USD{QUOTE}=X
+        c_direct, _ = fetch_yahoo_candles(f"USD{quote_ccy}", "15m", "1d", force=False)
+        if c_direct:
+            usd_to_quote = c_direct[-1]["close"]
+        else:
+            c_inv, _ = fetch_yahoo_candles(f"{quote_ccy}USD", "15m", "1d", force=False)
+            if c_inv and c_inv[-1]["close"] > 0:
+                usd_to_quote = 1.0 / c_inv[-1]["close"]
+
+    if usd_to_quote and usd_to_quote > 0:
+        return round(pip_in_quote / float(usd_to_quote), 4)
+
+    raise ValueError(f"Kurs live untuk konversi pip {p} ({quote_ccy}) sedang tidak tersedia.")
+
+
+def calc_basis_offset(pair: str, entry: float, candles: list, ref_ts: int = None) -> float:
+    """
+    Kalibrasi selisih harga HANYA untuk instrumen futures (seperti GC=F vs spot XAUUSD),
+    dan dicocokkan pada timestamp waktu entry dibuka (ref_ts), BUKAN harga live hari ini.
+    Pair spot FX selalu 0.0 agar tidak menggeser candle historis.
+    """
+    p = pair.upper().strip()
+    if p not in FUTURES_TICKERS or not candles or entry <= 0:
+        return 0.0
+
+    pv = pip_size_for(p)
+    ref_price = candles[-1]["close"]
+
+    if ref_ts:
+        matched = None
+        for c in candles:
+            if c["ts"] <= ref_ts:
+                matched = c["close"]
+            else:
+                if matched is None:
+                    matched = c["open"]
+                break
+        if matched is not None:
+            ref_price = matched
+
+    diff = entry - ref_price
+    return round(diff, decimals_for(p)) if abs(diff) > (5 * pv) else 0.0
 
 
 # ==========================================
-# LIVE FX STRENGTH
+# LIVE CURRENCY STRENGTH (100% MARKET CANDLES)
 # ==========================================
 def get_currency_strength(pair: str, side: str):
     now_ts = time.time()
-    if now_ts - CACHE_FX["ts"] > FX_TTL or not CACHE_FX["rates"]:
-        try:
-            r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=4)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("rates"):
-                    CACHE_FX["rates"] = data["rates"]
-                    CACHE_FX["ts"] = now_ts
-        except Exception as e:
-            log_msg(f"FX API timeout/err: {e}")
+    scores = CACHE_STRENGTH.get("scores", {}) if (now_ts - CACHE_STRENGTH["ts"] < STRENGTH_TTL) else {}
 
-    rates = CACHE_FX.get("rates", {})
-    majors = ["USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"]
+    if not scores:
+        usd_pairs = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCAD", "USDCHF"]
 
-    scores = {}
-    if rates:
-        baseline = {
-            "USD": 1.0, "EUR": 0.92, "GBP": 0.79, "JPY": 152.0,
-            "AUD": 1.54, "NZD": 1.69, "CAD": 1.39, "CHF": 0.88
-        }
+        def fetch_pct(sym: str):
+            d1, _ = fetch_yahoo_candles(sym, "1d", "5d", force=False)
+            if not d1:
+                return sym, None
+            last = d1[-1]
+            if last["open"] <= 0:
+                return sym, None
+            pct = ((last["close"] - last["open"]) / last["open"]) * 100.0
+            return sym, pct
+
         raw_perf = {}
-        for c in majors:
-            cur_r = rates.get(c, baseline[c])
-            perf = ((baseline[c] - cur_r) / baseline[c]) * 100.0 if c != "USD" else 0.0
-            raw_perf[c] = perf
-        raw_perf["USD"] = -sum(v for k, v in raw_perf.items() if k != "USD") / 7.0
+        with ThreadPoolExecutor(max_workers=7) as ex:
+            for sym, pct in ex.map(fetch_pct, usd_pairs):
+                if pct is None:
+                    continue
+                if sym.startswith("USD"):
+                    ccy = sym[3:]
+                    raw_perf[ccy] = -pct
+                else:
+                    ccy = sym[:3]
+                    raw_perf[ccy] = pct
 
-        min_p, max_p = min(raw_perf.values()), max(raw_perf.values())
-        span = (max_p - min_p) or 1.0
-        for c in majors:
-            scores[c] = round(2.0 + ((raw_perf[c] - min_p) / span) * 6.5, 1)
-    else:
-        scores = {"USD": 5.5, "EUR": 5.0, "GBP": 5.2, "JPY": 4.5, "AUD": 4.8, "NZD": 4.7, "CAD": 5.1, "CHF": 5.3}
+        if raw_perf:
+            raw_perf["USD"] = -sum(raw_perf.values()) / len(raw_perf)
+            min_p, max_p = min(raw_perf.values()), max(raw_perf.values())
+            span = max_p - min_p
+            scores = {}
+            for ccy, val in raw_perf.items():
+                if span > 0:
+                    scores[ccy] = round(1.0 + ((val - min_p) / span) * 8.0, 1)
+                else:
+                    scores[ccy] = 5.0
+            CACHE_STRENGTH["scores"] = scores
+            CACHE_STRENGTH["ts"] = now_ts
 
-    base_ccy = "XAU" if pair.startswith("XAU") else pair[:3]
+    base_ccy = "XAU" if pair.startswith("XAU") else ("XAG" if pair.startswith("XAG") else pair[:3])
     quote_ccy = pair[3:]
 
-    if base_ccy == "XAU":
-        usd_s = scores.get("USD", 5.0)
-        base_score = round(max(1.5, min(9.0, 10.5 - usd_s)), 1)
-    else:
-        base_score = scores.get(base_ccy, 5.0)
-    quote_score = scores.get(quote_ccy, 5.0)
+    if not scores:
+        return {
+            "available": False,
+            "base_ccy": base_ccy,
+            "quote_ccy": quote_ccy,
+            "base_score": None,
+            "quote_score": None,
+            "verdict": "UNAVAILABLE",
+            "note": "Data live performa mata uang mayor sedang tidak tersedia dari feed market.",
+            "ranking": [],
+        }
 
-    diff = round(base_score - quote_score, 1)
-    if side == "buy":
-        if diff >= 0.8:
-            verdict, note = "ALIGNED", f"{base_ccy} ({base_score}) lebih kuat dari {quote_ccy} ({quote_score}) — mendukung skenario BUY."
-        elif diff <= -0.8:
-            verdict, note = "COUNTER", f"Perhatian: {quote_ccy} ({quote_score}) lebih dominan dari {base_ccy} ({base_score}) (counter-strength)."
-        else:
-            verdict, note = "NEUTRAL", f"Kekuatan {base_ccy} vs {quote_ccy} relatif berimbang (selisih {diff})."
+    if base_ccy in ("XAU", "XAG"):
+        usd_s = scores.get("USD")
+        base_score = round(max(1.0, min(9.0, 10.0 - usd_s)), 1) if usd_s is not None else None
     else:
-        if diff <= -0.8:
-            verdict, note = "ALIGNED", f"{quote_ccy} ({quote_score}) lebih kuat dari {base_ccy} ({base_score}) — mendukung skenario SELL."
-        elif diff >= 0.8:
-            verdict, note = "COUNTER", f"Perhatian: {base_ccy} ({base_score}) lebih dominan dari {quote_ccy} ({quote_score}) (counter-strength)."
+        base_score = scores.get(base_ccy)
+    quote_score = scores.get(quote_ccy)
+
+    if base_score is None or quote_score is None:
+        verdict = "UNAVAILABLE"
+        note = f"Skor live untuk {base_ccy}/{quote_ccy} tidak lengkap."
+    else:
+        diff = round(base_score - quote_score, 1)
+        if side == "buy":
+            if diff >= 0.8:
+                verdict, note = "ALIGNED", f"{base_ccy} ({base_score}) lebih kuat dari {quote_ccy} ({quote_score}) berdasarkan performa candle harian live."
+            elif diff <= -0.8:
+                verdict, note = "COUNTER", f"Perhatian: {quote_ccy} ({quote_score}) lebih dominan dari {base_ccy} ({base_score}) (counter-strength)."
+            else:
+                verdict, note = "NEUTRAL", f"Kekuatan {base_ccy} vs {quote_ccy} relatif berimbang (selisih {diff})."
         else:
-            verdict, note = "NEUTRAL", f"Kekuatan {base_ccy} vs {quote_ccy} relatif berimbang (selisih {diff})."
+            if diff <= -0.8:
+                verdict, note = "ALIGNED", f"{quote_ccy} ({quote_score}) lebih kuat dari {base_ccy} ({base_score}) berdasarkan performa candle harian live."
+            elif diff >= 0.8:
+                verdict, note = "COUNTER", f"Perhatian: {base_ccy} ({base_score}) lebih dominan dari {quote_ccy} ({quote_score}) (counter-strength)."
+            else:
+                verdict, note = "NEUTRAL", f"Kekuatan {base_ccy} vs {quote_ccy} relatif berimbang (selisih {diff})."
 
     ranking = sorted([{"ccy": k, "score": v} for k, v in scores.items()], key=lambda x: x["score"], reverse=True)
     return {
+        "available": True,
         "base_ccy": base_ccy,
         "quote_ccy": quote_ccy,
         "base_score": base_score,
@@ -295,7 +390,7 @@ def get_upcoming_news(pair: str = ""):
             r = requests.get(
                 "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
                 headers=HEADERS_BROWSER,
-                timeout=5,
+                timeout=6,
             )
             if r.status_code == 200 and isinstance(r.json(), list):
                 CACHE_NEWS["events"] = r.json()
@@ -309,7 +404,7 @@ def get_upcoming_news(pair: str = ""):
     relevant_ccys = {"USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
     if pair:
         p = pair.upper()
-        relevant_ccys = {"USD"} if "XAU" in p else {p[:3], p[3:]}
+        relevant_ccys = {"USD"} if ("XAU" in p or "XAG" in p) else {p[:3], p[3:]}
 
     now_dt = datetime.now(timezone.utc)
     upcoming = []
@@ -355,7 +450,7 @@ def get_upcoming_news(pair: str = ""):
         is_unemp = "unemployment" in title.lower() or "claims" in title.lower()
         ccy_bullish = (f_num < p_num) if is_unemp else (f_num > p_num)
         if f_num != p_num:
-            if pair and pair.upper().startswith("XAU") and ccy == "USD":
+            if pair and (pair.upper().startswith("XAU") or pair.upper().startswith("XAG")) and ccy == "USD":
                 prediction = "BEARISH XAU (USD UP)" if ccy_bullish else "BULLISH XAU (USD DOWN)"
             elif pair and pair.upper().endswith(ccy):
                 prediction = f"BEARISH {pair.upper()}" if ccy_bullish else f"BULLISH {pair.upper()}"
@@ -411,7 +506,12 @@ def process_portfolio_lifecycle(state: dict, force_live: bool = False):
         if e.get("status") == "OPEN":
             candles, _ = fetch_yahoo_candles(e["pair"], "15m", "1mo", force=force_live)
             created_ts = e.get("created_ts", 0)
-            basis = float(e.get("basis_offset", 0.0))
+            # Paksa basis = 0.0 untuk spot FX meski ada entri lama yang tersimpan sebelum update
+            basis = float(e.get("basis_offset", 0.0)) if e["pair"] in FUTURES_TICKERS else 0.0
+            if e.get("basis_offset", 0.0) != basis:
+                e["basis_offset"] = basis
+                changed = True
+
             for c in candles:
                 if c["ts"] < created_ts:
                     continue
@@ -420,14 +520,14 @@ def process_portfolio_lifecycle(state: dict, force_live: bool = False):
                 if e["side"] == "buy":
                     if lo <= e["sl"]:
                         e["status"] = "SL_HIT"
-                        e["pnl_usd"] = -abs(float(e.get("est_sl_usd", 100.0)))
+                        e["pnl_usd"] = -abs(float(e.get("est_sl_usd", 0.0)))
                         e["pnl_pips"] = -abs(float(e.get("sl_pips", 0)))
                         e["closed_wib"] = now_wib.strftime("%Y-%m-%d %H:%M WIB")
                         changed = True
                         break
                     if hi >= e["tp"]:
                         e["status"] = "TP_HIT"
-                        e["pnl_usd"] = abs(float(e.get("est_tp_usd", 300.0)))
+                        e["pnl_usd"] = abs(float(e.get("est_tp_usd", 0.0)))
                         e["pnl_pips"] = abs(float(e.get("tp_pips", 0)))
                         e["closed_wib"] = now_wib.strftime("%Y-%m-%d %H:%M WIB")
                         changed = True
@@ -435,14 +535,14 @@ def process_portfolio_lifecycle(state: dict, force_live: bool = False):
                 else:
                     if hi >= e["sl"]:
                         e["status"] = "SL_HIT"
-                        e["pnl_usd"] = -abs(float(e.get("est_sl_usd", 100.0)))
+                        e["pnl_usd"] = -abs(float(e.get("est_sl_usd", 0.0)))
                         e["pnl_pips"] = -abs(float(e.get("sl_pips", 0)))
                         e["closed_wib"] = now_wib.strftime("%Y-%m-%d %H:%M WIB")
                         changed = True
                         break
                     if lo <= e["tp"]:
                         e["status"] = "TP_HIT"
-                        e["pnl_usd"] = abs(float(e.get("est_tp_usd", 300.0)))
+                        e["pnl_usd"] = abs(float(e.get("est_tp_usd", 0.0)))
                         e["pnl_pips"] = abs(float(e.get("tp_pips", 0)))
                         e["closed_wib"] = now_wib.strftime("%Y-%m-%d %H:%M WIB")
                         changed = True
@@ -463,6 +563,7 @@ def process_portfolio_lifecycle(state: dict, force_live: bool = False):
                     state["cooldown_until"] = (now_wib + timedelta(days=3)).isoformat()
 
             day_rec["trades"].append({
+                "id": e.get("id"),
                 "pair": e["pair"],
                 "side": e["side"].upper(),
                 "rr": e["rr"],
@@ -517,6 +618,21 @@ def process_portfolio_lifecycle(state: dict, force_live: bool = False):
     }
 
 
+def rebuild_monthly_sl_and_cooldown(state: dict):
+    """Menghitung ulang kuota SL bulanan & cooldown dari catatan daily_pnl aktual."""
+    monthly_sl = {}
+    for d_str, rec in state.get("daily_pnl", {}).items():
+        losses = int(rec.get("losses", 0))
+        if losses > 0:
+            m_key = d_str[:7]
+            monthly_sl[m_key] = monthly_sl.get(m_key, 0) + losses
+    state["monthly_sl"] = monthly_sl
+    now_wib = datetime.now(WIB)
+    cur_month = now_wib.strftime("%Y-%m")
+    if monthly_sl.get(cur_month, 0) < 3:
+        state["cooldown_until"] = None
+
+
 # ==========================================
 # ROUTES
 # ==========================================
@@ -564,116 +680,156 @@ def api_quant_analysis():
     state, zigft_rules = process_portfolio_lifecycle(state, force_live=False)
 
     m15, is_live = fetch_yahoo_candles(pair, "15m", "5d", force=False)
+    h1, _ = fetch_yahoo_candles(pair, "1h", "1mo", force=False)
     d1, _ = fetch_yahoo_candles(pair, "1d", "1y", force=False)
 
     pv = pip_size_for(pair)
     dec = decimals_for(pair)
 
-    spot_calibrated = False
-    basis = 0.0
-    if m15 and entry > 0:
-        last_close = m15[-1]["close"]
-        if abs(entry - last_close) > (20 * pv):
-            basis = entry - last_close
-            spot_calibrated = True
+    basis = calc_basis_offset(pair, entry, m15)
+    spot_calibrated = basis != 0.0
 
+    # 1. SMC Dealing Range & OTE (100% dari candle M15 live)
     if m15:
         recent = m15[-96:]
         rng_high = max(c["high"] for c in recent) + basis
         rng_low = min(c["low"] for c in recent) + basis
+        span = rng_high - rng_low
+        eq_50 = round(rng_low + 0.50 * span, dec)
+        if side == "buy":
+            fib_618 = round(rng_high - 0.618 * span, dec)
+            fib_750 = round(rng_high - 0.750 * span, dec)
+            in_ote = fib_750 <= entry <= eq_50
+            zone = "DISCOUNT OTE" if in_ote else ("DISCOUNT" if entry < eq_50 else "PREMIUM RISK")
+            verdict = "OPTIMAL" if in_ote else ("VALID" if entry <= eq_50 else "STRETCHED")
+        else:
+            fib_618 = round(rng_low + 0.618 * span, dec)
+            fib_750 = round(rng_low + 0.750 * span, dec)
+            in_ote = eq_50 <= entry <= fib_750
+            zone = "PREMIUM OTE" if in_ote else ("PREMIUM" if entry > eq_50 else "DISCOUNT RISK")
+            verdict = "OPTIMAL" if in_ote else ("VALID" if entry >= eq_50 else "STRETCHED")
+
+        smc_obj = {
+            "available": True,
+            "zone": zone,
+            "verdict": verdict,
+            "eq_50": eq_50,
+            "fib_618": fib_618,
+            "fib_750": fib_750,
+            "note": f"Dealing range 24 jam {round(rng_low, dec)} – {round(rng_high, dec)}. Entry berada di zona {zone}.",
+            "idm_swept": len(m15) >= 12,
+            "idm_note": "Minor internal swing terdeteksi — pastikan sweep IDM valid sebelum eksekusi.",
+        }
     else:
-        rng_high = entry + (40 * pv)
-        rng_low = entry - (40 * pv)
+        smc_obj = {
+            "available": False,
+            "zone": "UNAVAILABLE",
+            "verdict": "UNAVAILABLE",
+            "eq_50": None,
+            "fib_618": None,
+            "fib_750": None,
+            "note": "Candle M15 live sedang tidak tersedia untuk menghitung zona dealing range.",
+            "idm_swept": False,
+            "idm_note": "Menunggu feed candle live.",
+        }
 
-    span = max(rng_high - rng_low, 10 * pv)
-    eq_50 = round(rng_low + 0.50 * span, dec)
-    if side == "buy":
-        fib_618 = round(rng_high - 0.618 * span, dec)
-        fib_750 = round(rng_high - 0.750 * span, dec)
-        in_ote = fib_750 <= entry <= eq_50
-        zone = "DISCOUNT OTE" if in_ote else ("DISCOUNT" if entry < eq_50 else "PREMIUM RISK")
-        verdict = "OPTIMAL" if in_ote else ("VALID" if entry <= eq_50 else "STRETCHED")
-    else:
-        fib_618 = round(rng_low + 0.618 * span, dec)
-        fib_750 = round(rng_low + 0.750 * span, dec)
-        in_ote = eq_50 <= entry <= fib_750
-        zone = "PREMIUM OTE" if in_ote else ("PREMIUM" if entry > eq_50 else "DISCOUNT RISK")
-        verdict = "OPTIMAL" if in_ote else ("VALID" if entry >= eq_50 else "STRETCHED")
-
-    smc_obj = {
-        "zone": zone,
-        "verdict": verdict,
-        "eq_50": eq_50,
-        "fib_618": fib_618,
-        "fib_750": fib_750,
-        "note": f"Dealing range {round(rng_low, dec)} – {round(rng_high, dec)}. Entry berada di zona {zone}.",
-        "idm_swept": bool(m15 and len(m15) >= 12),
-        "idm_note": "Minor internal swing terdeteksi — pastikan sweep IDM valid sebelum eksekusi.",
-    }
-
-    if d1 and len(d1) >= 2:
-        pdh = round(d1[-2]["high"] + basis, dec)
-        pdl = round(d1[-2]["low"] + basis, dec)
-        week_slice = d1[-7:-1] if len(d1) >= 7 else d1[:-1]
+    # 2. Liquidity Pools (100% dari candle D1 & M15 asli)
+    pdh = round(d1[-2]["high"] + basis, dec) if len(d1) >= 2 else None
+    pdl = round(d1[-2]["low"] + basis, dec) if len(d1) >= 2 else None
+    if len(d1) >= 6:
+        week_slice = d1[-6:-1]
         pwh = round(max(c["high"] for c in week_slice) + basis, dec)
         pwl = round(min(c["low"] for c in week_slice) + basis, dec)
     else:
-        pdh, pdl = round(rng_high, dec), round(rng_low, dec)
-        pwh, pwl = round(rng_high + 25 * pv, dec), round(rng_low - 25 * pv, dec)
+        pwh, pwl = None, None
 
-    asian_slice = m15[-32:-16] if len(m15) >= 32 else (m15[-16:] if m15 else [])
-    asian_high = round(max((c["high"] for c in asian_slice), default=pdh) + (basis if asian_slice else 0), dec)
-    asian_low = round(min((c["low"] for c in asian_slice), default=pdl) + (basis if asian_slice else 0), dec)
+    asian_candles = [c for c in m15[-96:] if 4 <= datetime.fromtimestamp(c["ts"], tz=WIB).hour < 13]
+    asian_high = round(max(c["high"] for c in asian_candles) + basis, dec) if asian_candles else None
+    asian_low = round(min(c["low"] for c in asian_candles) + basis, dec) if asian_candles else None
 
     sweep_alerts = []
     for lbl, lvl in [("PDH", pdh), ("PDL", pdl), ("PWH", pwh), ("PWL", pwl), ("Asian High", asian_high), ("Asian Low", asian_low)]:
-        if abs(sl - lvl) <= (12 * pv):
+        if lvl is not None and abs(sl - lvl) <= (12 * pv):
             sweep_alerts.append(f"SL ({sl}) terlalu dekat dengan {lbl} ({lvl}) — rawan liquidity sweep.")
 
+    # 3. Killzone & Session Window (WIB)
     now_wib = datetime.now(WIB)
     hr, wd = now_wib.hour, now_wib.weekday()
     days_id = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
     is_weekend = (wd == 5 and hr >= 4) or wd == 6 or (wd == 0 and hr < 4)
     if 14 <= hr < 17:
-        kz_name, kz_qual = "LONDON KILLZONE", "KILLZONE"
+        kz_name, kz_qual, kz_hours = "LONDON KILLZONE", "KILLZONE", {14, 15, 16}
     elif 19 <= hr < 23:
-        kz_name, kz_qual = "NEW YORK KILLZONE", "KILLZONE"
+        kz_name, kz_qual, kz_hours = "NEW YORK KILLZONE", "KILLZONE", {19, 20, 21, 22}
     elif 4 <= hr < 7:
-        kz_name, kz_qual = "ROLLOVER / SPREAD WIDENING", "SPREAD_RISK"
+        kz_name, kz_qual, kz_hours = "ROLLOVER / SPREAD WIDENING", "SPREAD_RISK", {4, 5, 6}
     else:
-        kz_name, kz_qual = "ASIAN / INTER-SESSION", "NORMAL"
+        kz_name, kz_qual, kz_hours = "ASIAN / INTER-SESSION", "NORMAL", {0, 1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 17, 18, 23}
 
-    if d1 and len(d1) >= 15:
-        trs = [max(d1[i]["high"] - d1[i]["low"], abs(d1[i]["high"] - d1[i - 1]["close"]), abs(d1[i]["low"] - d1[i - 1]["close"])) for i in range(-14, 0)]
+    # 4. Volatility ATR-14 (100% dari candle D1 asli)
+    if len(d1) >= 2:
+        lookback = min(14, len(d1) - 1)
+        trs = [
+            max(
+                d1[i]["high"] - d1[i]["low"],
+                abs(d1[i]["high"] - d1[i - 1]["close"]),
+                abs(d1[i]["low"] - d1[i - 1]["close"]),
+            )
+            for i in range(-lookback, 0)
+        ]
         atr_pips = round((sum(trs) / len(trs)) / pv, 1)
         today_pips = round((d1[-1]["high"] - d1[-1]["low"]) / pv, 1)
+        exh_pct = round((today_pips / atr_pips) * 100, 1) if atr_pips > 0 else 0.0
+        atr_status = "STRETCHED" if exh_pct >= 85 else "OPTIMAL"
+        vol_note = f"Pergerakan harian telah memakai {exh_pct}% dari rata-rata ATR-{lookback} ({atr_pips} pips)."
     else:
-        atr_pips = 280.0 if "XAU" in pair else 85.0
-        today_pips = round(atr_pips * 0.45, 1)
+        atr_pips, today_pips, exh_pct = None, None, None
+        atr_status = "UNAVAILABLE"
+        vol_note = "Data harian tidak cukup untuk menghitung ATR."
 
-    exh_pct = round((today_pips / atr_pips) * 100, 1) if atr_pips > 0 else 50.0
-    atr_status = "STRETCHED" if exh_pct >= 85 else "OPTIMAL"
-
+    # 5. Seasonality Day & Session (100% dari candle historis D1 & H1 asli)
     day_wins, day_tot, day_moves = 0, 0, []
-    if d1:
-        for c in d1:
-            if datetime.fromtimestamp(c["ts"], tz=WIB).weekday() == wd:
-                day_tot += 1
-                day_moves.append(abs(c["close"] - c["open"]) / pv)
-                if (side == "buy" and c["close"] > c["open"]) or (side == "sell" and c["close"] < c["open"]):
-                    day_wins += 1
-    day_wr = round((day_wins / day_tot) * 100, 1) if day_tot > 0 else 52.0
-    day_med = round(sorted(day_moves)[len(day_moves) // 2], 1) if day_moves else round(atr_pips * 0.6, 1)
+    for c in d1:
+        if datetime.fromtimestamp(c["ts"], tz=WIB).weekday() == wd:
+            day_tot += 1
+            day_moves.append(abs(c["close"] - c["open"]) / pv)
+            if (side == "buy" and c["close"] > c["open"]) or (side == "sell" and c["close"] < c["open"]):
+                day_wins += 1
+    day_wr = round((day_wins / day_tot) * 100, 1) if day_tot > 0 else None
+    day_med = round(sorted(day_moves)[len(day_moves) // 2], 1) if day_moves else None
 
-    usd_per_pip = usd_per_pip_for(pair)
+    sess_by_date = {}
+    for c in h1:
+        dt_c = datetime.fromtimestamp(c["ts"], tz=WIB)
+        if dt_c.hour in kz_hours:
+            d_key = dt_c.strftime("%Y-%m-%d")
+            grp = sess_by_date.setdefault(d_key, {"open": c["open"], "close": c["close"], "high": c["high"], "low": c["low"]})
+            grp["close"] = c["close"]
+            grp["high"] = max(grp["high"], c["high"])
+            grp["low"] = min(grp["low"], c["low"])
+
+    sess_wins, sess_tot, sess_moves = 0, len(sess_by_date), []
+    for grp in sess_by_date.values():
+        sess_moves.append((grp["high"] - grp["low"]) / pv)
+        if (side == "buy" and grp["close"] > grp["open"]) or (side == "sell" and grp["close"] < grp["open"]):
+            sess_wins += 1
+    sess_wr = round((sess_wins / sess_tot) * 100, 1) if sess_tot > 0 else None
+    sess_med = round(sorted(sess_moves)[len(sess_moves) // 2], 1) if sess_moves else None
+
+    try:
+        usd_per_pip = usd_per_pip_for(pair)
+        est_sl_usd = round(sl_pips * usd_per_pip, 2)
+        est_tp_usd = round(tp_pips * usd_per_pip, 2)
+    except ValueError:
+        usd_per_pip, est_sl_usd, est_tp_usd = None, None, None
 
     return jsonify({
-        "feed_source": "YAHOO LIVE" if is_live else "CACHE / FALLBACK",
+        "feed_source": "YAHOO LIVE" if is_live else "CACHE / UNAVAILABLE",
         "spot_calibrated": spot_calibrated,
         "side": side.upper(),
-        "usd_per_pip_1lot": round(usd_per_pip, 2),
-        "est_sl_usd_1lot": round(sl_pips * usd_per_pip, 2),
-        "est_tp_usd_1lot": round(tp_pips * usd_per_pip, 2),
+        "usd_per_pip_1lot": round(usd_per_pip, 2) if usd_per_pip is not None else None,
+        "est_sl_usd_1lot": est_sl_usd,
+        "est_tp_usd_1lot": est_tp_usd,
         "zigft_rules": zigft_rules,
         "news_prediction": get_upcoming_news(pair),
         "smc": smc_obj,
@@ -694,7 +850,7 @@ def api_quant_analysis():
             "today_range_pips": today_pips,
             "atr_14_pips": atr_pips,
             "exhaustion_pct": exh_pct,
-            "note": f"Pergerakan harian telah memakai {exh_pct}% dari rata-rata ATR-14.",
+            "note": vol_note,
         },
         "strength": get_currency_strength(pair, side),
         "seasonality": {
@@ -703,9 +859,9 @@ def api_quant_analysis():
             "day_samples": day_tot,
             "day_median_pips": day_med,
             "session_name": kz_name,
-            "session_winrate": round(min(74.0, day_wr + 3.5), 1),
-            "session_samples": max(day_tot, 20),
-            "session_median_pips": round(day_med * 0.55, 1),
+            "session_winrate": sess_wr,
+            "session_samples": sess_tot,
+            "session_median_pips": sess_med,
         },
     })
 
@@ -719,11 +875,6 @@ def api_entries():
     if not body.get("inducement_confirmed") or not body.get("liquidity_confirmed"):
         return jsonify({"error": "Wajib konfirmasi Inducement (IDM) dan Liquidity Pool sesuai aturan ZIGFT."}), 400
 
-    state = load_state()
-    state, zigft_rules = process_portfolio_lifecycle(state, force_live=False)
-    if not zigft_rules["can_enter"]:
-        return jsonify({"error": zigft_rules["block_reason"]}), 403
-
     pair = str(body.get("pair", "")).upper().strip()
     side = str(body.get("side", "buy")).lower().strip()
     entry = float(body.get("entry", 0))
@@ -731,13 +882,25 @@ def api_entries():
     tp = float(body.get("tp", 0))
     sl_pips = float(body.get("sl_pips", 0))
     tp_pips = float(body.get("tp_pips", 0))
-    rr = float(body.get("rr", 3.0))
+    rr = float(body.get("rr", 0))
+
+    if side == "buy" and not (sl < entry < tp):
+        return jsonify({"error": "Arah BUY tidak valid: SL harus di bawah Entry dan TP di atas Entry."}), 400
+    if side == "sell" and not (tp < entry < sl):
+        return jsonify({"error": "Arah SELL tidak valid: SL harus di atas Entry dan TP di bawah Entry."}), 400
+
+    state = load_state()
+    state, zigft_rules = process_portfolio_lifecycle(state, force_live=False)
+    if not zigft_rules["can_enter"]:
+        return jsonify({"error": zigft_rules["block_reason"]}), 403
+
+    try:
+        usd_per_pip = usd_per_pip_for(pair)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 502
 
     m15, _ = fetch_yahoo_candles(pair, "15m", "5d", force=False)
-    pv = pip_size_for(pair)
-    basis = (entry - m15[-1]["close"]) if (m15 and abs(entry - m15[-1]["close"]) > (20 * pv)) else 0.0
-
-    usd_per_pip = usd_per_pip_for(pair)
+    basis = calc_basis_offset(pair, entry, m15)
     now_wib = datetime.now(WIB)
 
     new_entry = {
@@ -749,7 +912,7 @@ def api_entries():
         "tp": tp,
         "sl_pips": sl_pips,
         "tp_pips": tp_pips,
-        "rr": rr,
+        "rr": rr if rr > 0 else (round(tp_pips / sl_pips, 2) if sl_pips > 0 else 0.0),
         "basis_offset": basis,
         "est_sl_usd": round(sl_pips * usd_per_pip, 2),
         "est_tp_usd": round(tp_pips * usd_per_pip, 2),
@@ -790,23 +953,32 @@ def api_entries_manual():
     sl = float(body.get("sl", 0))
     tp = float(body.get("tp", 0))
     trade_date = str(body.get("trade_date", "")).strip()
-    trade_time = str(body.get("trade_time", "08:00")).strip() or "08:00"
+    trade_time = str(body.get("trade_time", "")).strip()
 
     if entry <= 0 or sl <= 0 or tp <= 0 or not trade_date:
         return jsonify({"error": "Lengkapi Pair, Entry, SL, TP, dan Tanggal Trade."}), 400
 
+    if side == "buy" and not (sl < entry < tp):
+        return jsonify({"error": "Arah BUY tidak valid: SL harus di bawah Entry dan TP di atas Entry."}), 400
+    if side == "sell" and not (tp < entry < sl):
+        return jsonify({"error": "Arah SELL tidak valid: SL harus di atas Entry dan TP di bawah Entry."}), 400
+
+    try:
+        usd_per_pip = usd_per_pip_for(pair)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 502
+
     pv = pip_size_for(pair)
     sl_pips = round(abs(entry - sl) / pv, 1)
     tp_pips = round(abs(tp - entry) / pv, 1)
-    rr = round(tp_pips / sl_pips, 2) if sl_pips > 0 else 3.0
-    usd_per_pip = usd_per_pip_for(pair)
+    rr = round(tp_pips / sl_pips, 2) if sl_pips > 0 else 0.0
     est_sl_usd = round(sl_pips * usd_per_pip, 2)
     est_tp_usd = round(tp_pips * usd_per_pip, 2)
 
     state = load_state()
     now_wib = datetime.now(WIB)
 
-    # 1. Jika trade SUDAH TP atau SUDAH SL dari hari lampau -> langsung masuk Kalender PnL permanen
+    # 1. Trade SUDAH TP atau SUDAH SL -> langsung masuk Kalender PnL permanen
     if outcome in ("TP_HIT", "SL_HIT"):
         day_rec = state["daily_pnl"].setdefault(trade_date, {"pnl_usd": 0.0, "wins": 0, "losses": 0, "trades": []})
         pnl_val = est_tp_usd if outcome == "TP_HIT" else -est_sl_usd
@@ -823,8 +995,12 @@ def api_entries_manual():
                 state["cooldown_until"] = (now_wib + timedelta(days=3)).isoformat()
 
         day_rec["trades"].append({
+            "id": f"ZIGFT-M-{int(now_wib.timestamp())}",
             "pair": pair,
             "side": side.upper(),
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
             "rr": rr,
             "result": outcome,
             "pnl_usd": pnl_val,
@@ -841,14 +1017,15 @@ def api_entries_manual():
             "message": f"Riwayat {pair} ({outcome}) tanggal {trade_date} berhasil masuk permanen ke Kalender PnL!",
         })
 
-    # 2. Jika trade MASIH BERJALAN (OPEN) sejak tanggal/jam lampau
+    # 2. Trade MASIH BERJALAN (OPEN) sejak tanggal/jam lampau
+    eff_time = trade_time if trade_time else now_wib.strftime("%H:%M")
     try:
-        opened_dt = datetime.fromisoformat(f"{trade_date}T{trade_time}:00+07:00")
+        opened_dt = datetime.fromisoformat(f"{trade_date}T{eff_time}:00+07:00")
     except Exception:
-        opened_dt = now_wib
+        return jsonify({"error": "Format Tanggal / Jam Trade tidak valid."}), 400
 
     m15, _ = fetch_yahoo_candles(pair, "15m", "1mo", force=True)
-    basis = (entry - m15[-1]["close"]) if (m15 and abs(entry - m15[-1]["close"]) > (20 * pv)) else 0.0
+    basis = calc_basis_offset(pair, entry, m15, int(opened_dt.timestamp()))
 
     new_entry = {
         "id": f"ZIGFT-BF-{int(now_wib.timestamp())}",
@@ -883,6 +1060,118 @@ def api_entries_manual():
         "status": "ok",
         "message": f"Trade berjalan {pair} {side.upper()} sejak {opened_dt.strftime('%d %b %H:%M WIB')} berhasil disinkronkan & dicek ke candle live!",
     })
+
+
+# ==========================================
+# AUDIT ENDPOINTS (EDIT / HAPUS DATA)
+# ==========================================
+@app.route("/api/entries/<entry_id>", methods=["PATCH", "DELETE", "OPTIONS"])
+def api_audit_raw_entry(entry_id: str):
+    if request.method == "OPTIONS":
+        return ("", 200)
+
+    state = load_state()
+    entries = state.get("entries", [])
+    idx = next((i for i, e in enumerate(entries) if e.get("id") == entry_id), None)
+    if idx is None:
+        return jsonify({"error": "Entry tidak ditemukan (mungkin sudah di-purge otomatis)."}), 404
+
+    if request.method == "DELETE":
+        removed = entries.pop(idx)
+        ok, err_msg = save_state(state)
+        if not ok:
+            return jsonify({"error": err_msg}), 500
+        return jsonify({"status": "ok", "message": f"Entry {removed['pair']} dihapus dari daftar aktif."})
+
+    body = request.get_json(silent=True) or {}
+    e = entries[idx]
+    pair = str(body.get("pair", e["pair"])).upper().strip()
+    side = str(body.get("side", e["side"])).lower().strip()
+    entry = float(body.get("entry", e["entry"]))
+    sl = float(body.get("sl", e["sl"]))
+    tp = float(body.get("tp", e["tp"]))
+
+    if side == "buy" and not (sl < entry < tp):
+        return jsonify({"error": "Arah BUY tidak valid: SL harus di bawah Entry dan TP di atas Entry."}), 400
+    if side == "sell" and not (tp < entry < sl):
+        return jsonify({"error": "Arah SELL tidak valid: SL harus di atas Entry dan TP di bawah Entry."}), 400
+
+    usd_per_pip = usd_per_pip_for(pair)
+    pv = pip_size_for(pair)
+    sl_pips = round(abs(entry - sl) / pv, 1)
+    tp_pips = round(abs(tp - entry) / pv, 1)
+    m15, _ = fetch_yahoo_candles(pair, "15m", "1mo", force=True)
+
+    e.update({
+        "pair": pair,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "sl_pips": sl_pips,
+        "tp_pips": tp_pips,
+        "rr": round(tp_pips / sl_pips, 2) if sl_pips > 0 else 0.0,
+        "basis_offset": calc_basis_offset(pair, entry, m15, e.get("created_ts")),
+        "est_sl_usd": round(sl_pips * usd_per_pip, 2),
+        "est_tp_usd": round(tp_pips * usd_per_pip, 2),
+        "status": "OPEN",
+        "pnl_usd": 0.0,
+        "pnl_pips": 0.0,
+        "settled": False,
+        "audited_wib": datetime.now(WIB).strftime("%d %b %H:%M WIB"),
+    })
+
+    state, _ = process_portfolio_lifecycle(state, force_live=True)
+    ok, err_msg = save_state(state)
+    if not ok:
+        return jsonify({"error": err_msg}), 500
+    return jsonify({"status": "ok", "message": f"Audit tersimpan & dicek ulang ke candle live: {pair} {side.upper()}."})
+
+
+@app.route("/api/portfolio/settled", methods=["PATCH", "DELETE", "OPTIONS"])
+def api_audit_settled_trade():
+    if request.method == "OPTIONS":
+        return ("", 200)
+
+    body = request.get_json(silent=True) or {}
+    trade_date = str(body.get("date", "")).strip()
+    trade_idx = int(body.get("index", -1))
+
+    state = load_state()
+    day_rec = state.get("daily_pnl", {}).get(trade_date)
+    if not day_rec or trade_idx < 0 or trade_idx >= len(day_rec.get("trades", [])):
+        return jsonify({"error": "Catatan trade kalender tidak ditemukan."}), 404
+
+    if request.method == "DELETE":
+        day_rec["trades"].pop(trade_idx)
+    else:
+        tr = day_rec["trades"][trade_idx]
+        if "pair" in body:
+            tr["pair"] = str(body["pair"]).upper().strip()
+        if "side" in body:
+            tr["side"] = str(body["side"]).upper().strip()
+        if "result" in body:
+            new_res = str(body["result"]).upper().strip()
+            tr["result"] = new_res
+            mag_usd = abs(float(tr.get("pnl_usd", 0.0)))
+            mag_pips = abs(float(tr.get("pnl_pips", 0.0)))
+            tr["pnl_usd"] = mag_usd if new_res == "TP_HIT" else -mag_usd
+            tr["pnl_pips"] = mag_pips if new_res == "TP_HIT" else -mag_pips
+        if "pnl_usd" in body:
+            tr["pnl_usd"] = round(float(body["pnl_usd"]), 2)
+
+    if not day_rec["trades"]:
+        del state["daily_pnl"][trade_date]
+    else:
+        day_rec["pnl_usd"] = round(sum(float(t.get("pnl_usd", 0.0)) for t in day_rec["trades"]), 2)
+        day_rec["wins"] = sum(1 for t in day_rec["trades"] if t.get("result") == "TP_HIT")
+        day_rec["losses"] = sum(1 for t in day_rec["trades"] if t.get("result") == "SL_HIT")
+
+    rebuild_monthly_sl_and_cooldown(state)
+    ok, err_msg = save_state(state)
+    if not ok:
+        return jsonify({"error": err_msg}), 500
+    return jsonify({"status": "ok", "message": f"Audit kalender tanggal {trade_date} berhasil diperbarui."})
 
 
 @app.route("/api/portfolio", methods=["GET"])
