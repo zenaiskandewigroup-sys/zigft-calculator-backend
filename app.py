@@ -8,8 +8,12 @@ app = Flask(__name__)
 
 WIB = timezone(timedelta(hours=7))
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+RAW_SB_URL = os.environ.get("SUPABASE_URL", "").strip().strip('"').strip("'").rstrip("/")
+if RAW_SB_URL and not RAW_SB_URL.startswith("http"):
+    RAW_SB_URL = f"https://{RAW_SB_URL}"
+
+SUPABASE_URL = RAW_SB_URL
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip().strip('"').strip("'")
 
 HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -58,8 +62,19 @@ def add_cors_headers(response):
 
 
 # ==========================================
-# SUPABASE PERSISTENT STATE (FIXED UPSERT)
+# SUPABASE PERSISTENT STATE (DUAL KEY SUPPORT)
 # ==========================================
+def supabase_headers():
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+    }
+    # Format key baru Supabase (sb_secret_...) bukan JWT, jangan dikirim ke Authorization Bearer
+    if SUPABASE_KEY.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {SUPABASE_KEY}"
+    return headers
+
+
 def default_state():
     return {
         "entries": [],
@@ -74,17 +89,15 @@ def load_state():
         return default_state()
     try:
         url = f"{SUPABASE_URL}/rest/v1/zigft_state?id=eq.main&select=payload"
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-        }
-        r = requests.get(url, headers=headers, timeout=5)
+        r = requests.get(url, headers=supabase_headers(), timeout=8)
         if r.status_code == 200:
             rows = r.json()
             if rows and isinstance(rows[0].get("payload"), dict):
                 st = default_state()
                 st.update(rows[0]["payload"])
                 return st
+        else:
+            log_msg(f"Supabase load HTTP {r.status_code}: {r.text[:160]}")
     except Exception as e:
         log_msg(f"Supabase load error: {e}")
     return default_state()
@@ -92,28 +105,25 @@ def load_state():
 
 def save_state(state: dict):
     if not SUPABASE_URL or not SUPABASE_KEY:
-        return False
+        return False, "ENV SUPABASE_URL atau SUPABASE_KEY di Render belum terbaca (kosong)."
     try:
         url = f"{SUPABASE_URL}/rest/v1/zigft_state?on_conflict=id"
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates,return=minimal",
-        }
+        headers = supabase_headers()
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
         body = {
             "id": "main",
             "payload": state,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        r = requests.post(url, headers=headers, json=body, timeout=5)
+        r = requests.post(url, headers=headers, json=body, timeout=8)
         if r.status_code not in (200, 201, 204):
-            log_msg(f"Supabase save HTTP {r.status_code}: {r.text}")
-            return False
-        return True
+            err_txt = r.text[:180]
+            log_msg(f"Supabase save HTTP {r.status_code}: {err_txt}")
+            return False, f"Supabase HTTP {r.status_code}: {err_txt}"
+        return True, ""
     except Exception as e:
         log_msg(f"Supabase save error: {e}")
-        return False
+        return False, f"Koneksi Supabase gagal: {e}"
 
 
 # ==========================================
@@ -513,10 +523,19 @@ def process_portfolio_lifecycle(state: dict, force_live: bool = False):
 @app.route("/health", methods=["GET"])
 def health():
     age = round(time.time() - CACHE_NEWS["ts"], 1) if CACHE_NEWS["ts"] > 0 else None
+    key_type = "EMPTY"
+    if SUPABASE_KEY.startswith("eyJ"):
+        key_type = "JWT_LEGACY"
+    elif SUPABASE_KEY.startswith("sb_"):
+        key_type = "SB_NEW_KEY"
+    elif SUPABASE_KEY:
+        key_type = "CUSTOM"
+
     return jsonify({
         "status": "online",
         "service": "ZIGFT Quant & Portfolio Engine",
-        "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
+        "supabase_url_set": bool(SUPABASE_URL),
+        "supabase_key_type": key_type,
         "news_cached_count": len(CACHE_NEWS.get("events", [])),
         "cache_age_sec": age,
     })
@@ -744,8 +763,9 @@ def api_entries():
     }
 
     state["entries"].append(new_entry)
-    if not save_state(state):
-        return jsonify({"error": "Gagal menyimpan data ke Supabase. Cek Environment Variables di Render."}), 500
+    ok, err_msg = save_state(state)
+    if not ok:
+        return jsonify({"error": err_msg}), 500
 
     log_msg(f"Entry logged & saved: {pair} {side.upper()}")
     return jsonify({
@@ -811,8 +831,9 @@ def api_entries_manual():
             "pnl_pips": pnl_pips,
         })
 
-        if not save_state(state):
-            return jsonify({"error": "Gagal menyimpan riwayat ke Supabase."}), 500
+        ok, err_msg = save_state(state)
+        if not ok:
+            return jsonify({"error": err_msg}), 500
 
         log_msg(f"Backfill settled: {pair} {side.upper()} {outcome} on {trade_date} (${pnl_val})")
         return jsonify({
@@ -854,8 +875,9 @@ def api_entries_manual():
 
     state["entries"].append(new_entry)
     state, _ = process_portfolio_lifecycle(state, force_live=True)
-    if not save_state(state):
-        return jsonify({"error": "Gagal menyimpan trade berjalan ke Supabase."}), 500
+    ok, err_msg = save_state(state)
+    if not ok:
+        return jsonify({"error": err_msg}), 500
 
     return jsonify({
         "status": "ok",
